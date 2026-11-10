@@ -1,4 +1,13 @@
 
+/**
+ * Rate Limiter for API requests and token usage.
+ *
+ * Implements a sliding-window rate limiter:
+ * - Tracks requests and tokens used in the last 60 seconds.
+ * - Limits concurrent requests.
+ * - Uses a FIFO wait queue for concurrent requests.
+ */
+
 export interface RateLimiterConfig {
   maxRequestsPerMinute: number;
   maxTokensPerMinute: number;
@@ -17,9 +26,8 @@ interface RequestRecord {
 }
 
 const WINDOW_MS = 60_000;
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise(resolve => setTimeout(resolve, ms));
+const MAX_WAIT_MS = 5_000;
+const MIN_WAIT_MS = 100;
 
 export class RateLimiter {
   private config: RateLimiterConfig;
@@ -30,65 +38,74 @@ export class RateLimiter {
   constructor(config: Partial<RateLimiterConfig> = {}) {
     this.config = { ...DEFAULT_RATE_LIMITS, ...config };
 
-    for (const [key, value] of Object.entries(this.config)) {
-      if (!Number.isFinite(value) || value <= 0) {
-        throw new RangeError(`${key} must be a positive number`);
-      }
+    if (
+      this.config.maxRequestsPerMinute <= 0 ||
+      this.config.maxTokensPerMinute <= 0 ||
+      this.config.maxConcurrent <= 0
+    ) {
+      throw new Error('Rate limiter configuration values must be positive.');
     }
   }
 
+  /**
+   * Acquire permission to execute a request.
+   */
   async acquire(estimatedTokens: number = 1000): Promise<void> {
     if (!Number.isFinite(estimatedTokens) || estimatedTokens < 0) {
-      throw new RangeError('estimatedTokens must be non-negative');
+      throw new Error('estimatedTokens must be a non-negative number.');
     }
 
     if (estimatedTokens > this.config.maxTokensPerMinute) {
-      throw new RangeError(
-        'Estimated tokens exceed the entire per-minute token limit'
+      throw new Error(
+        'Estimated tokens exceed the configured tokens-per-minute limit.'
       );
     }
 
-    // Check rate limits before reserving a concurrent slot.
+    // Wait for a concurrent request slot.
+    while (this.activeRequests >= this.config.maxConcurrent) {
+      await this.waitForSlot();
+    }
+
+    // Wait until request and token limits permit execution.
     await this.waitForRateLimit(estimatedTokens);
 
-    // Reserve the slot atomically.
-    await this.waitForSlot();
+    // Reserve a concurrent slot.
+    this.activeRequests++;
 
-    try {
-      // Recheck because other requests may have entered the window.
-      await this.waitForRateLimit(estimatedTokens);
-
-      this.pruneOldRecords();
-
-      this.requestHistory.push({
-        timestamp: Date.now(),
-        tokens: estimatedTokens
-      });
-    } catch (error) {
-      this.release();
-      throw error;
-    }
+    // Record this request in the sliding window.
+    this.requestHistory.push({
+      timestamp: Date.now(),
+      tokens: estimatedTokens
+    });
   }
 
+  /**
+   * Release a request slot after completion.
+   */
   release(actualTokens?: number): void {
     this.activeRequests = Math.max(0, this.activeRequests - 1);
 
-    if (
-      actualTokens !== undefined &&
-      Number.isFinite(actualTokens) &&
-      actualTokens >= 0 &&
-      this.requestHistory.length > 0
-    ) {
-      // The public API does not identify individual request records.
-      // This updates the latest record as a best-effort estimate.
-      const last = this.requestHistory[this.requestHistory.length - 1];
-      last.tokens = actualTokens;
+    // Update the most recent request estimate.
+    if (actualTokens !== undefined) {
+      const lastRequest =
+        this.requestHistory[this.requestHistory.length - 1];
+
+      if (lastRequest) {
+        lastRequest.tokens = Math.max(0, actualTokens);
+      }
     }
 
+    // Wake the next queued request.
     const next = this.waitQueue.shift();
-    if (next) next();
+
+    if (next) {
+      next();
+    }
   }
 
+  /**
+   * Get current rate limit status.
+   */
   getStatus(): {
     activeRequests: number;
     requestsInWindow: number;
@@ -99,6 +116,7 @@ export class RateLimiter {
     this.pruneOldRecords();
 
     const requestsInWindow = this.requestHistory.length;
+
     const tokensInWindow = this.requestHistory.reduce(
       (sum, record) => sum + record.tokens,
       0
@@ -119,10 +137,14 @@ export class RateLimiter {
     };
   }
 
+  /**
+   * Check whether a request can proceed immediately.
+   */
   canProceed(estimatedTokens: number = 1000): boolean {
     this.pruneOldRecords();
 
     const requestsInWindow = this.requestHistory.length;
+
     const tokensInWindow = this.requestHistory.reduce(
       (sum, record) => sum + record.tokens,
       0
@@ -136,84 +158,81 @@ export class RateLimiter {
     );
   }
 
+  /**
+   * Wait for a concurrent request slot.
+   */
   private async waitForSlot(): Promise<void> {
-    while (this.activeRequests >= this.config.maxConcurrent) {
-      await new Promise<void>(resolve => {
-        this.waitQueue.push(resolve);
-      });
-    }
-
-    // Reserve before returning to prevent oversubscription.
-    this.activeRequests++;
+    await new Promise<void>((resolve) => {
+      this.waitQueue.push(resolve);
+    });
   }
 
+  /**
+   * Wait until rate limits allow the request.
+   */
   private async waitForRateLimit(
     estimatedTokens: number
   ): Promise<void> {
-    while (true) {
+    while (!this.canProceed(estimatedTokens)) {
       this.pruneOldRecords();
 
-      const requests = this.requestHistory.length;
-      const tokens = this.requestHistory.reduce(
-        (sum, record) => sum + record.tokens,
-        0
-      );
-
-      const requestsAvailable =
-        requests < this.config.maxRequestsPerMinute;
-
-      const tokensAvailable =
-        tokens + estimatedTokens <= this.config.maxTokensPerMinute;
-
-      if (requestsAvailable && tokensAvailable) {
-        return;
-      }
-
       if (this.requestHistory.length === 0) {
-        throw new Error('Unable to satisfy rate limit configuration');
+        break;
       }
 
-      const oldestTimestamp = this.requestHistory[0].timestamp;
+      const oldestRecord = this.requestHistory[0];
 
-      const expirationTime = oldestTimestamp + WINDOW_MS;
+      if (!oldestRecord) {
+        break;
+      }
+
+      const expirationTime =
+        oldestRecord.timestamp + WINDOW_MS;
+
+      const remainingTime =
+        expirationTime - Date.now() + MIN_WAIT_MS;
 
       const waitTime = Math.min(
-        5000,
-        Math.max(100, expirationTime - Date.now() + 100)
+        MAX_WAIT_MS,
+        Math.max(MIN_WAIT_MS, remainingTime)
       );
 
-      await sleep(waitTime);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, waitTime);
+      });
     }
   }
 
+  /**
+   * Remove records older than the 60-second window.
+   */
   private pruneOldRecords(): void {
     const cutoff = Date.now() - WINDOW_MS;
 
     this.requestHistory = this.requestHistory.filter(
-      record => record.timestamp > cutoff
+      (record) => record.timestamp > cutoff
     );
   }
 }
 
-export function withRateLimit<T>(
+/**
+ * Wrap an asynchronous function with rate limiting.
+ */
+export async function withRateLimit<T>(
   rateLimiter: RateLimiter,
   fn: () => Promise<T>,
   estimatedTokens: number = 1000
 ): Promise<T> {
-  return (async () => {
-    let acquired = false;
+  await rateLimiter.acquire(estimatedTokens);
 
-    try {
-      await rateLimiter.acquire(estimatedTokens);
-      acquired = true;
-
-      return await fn();
-    } finally {
-      if (acquired) {
-        rateLimiter.release();
-      }
-    }
-  })();
+  try {
+    return await fn();
+  } finally {
+    rateLimiter.release();
+  }
 }
 
+/**
+ * Global rate limiter instance.
+ */
 export const globalRateLimiter = new RateLimiter();
