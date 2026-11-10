@@ -10,6 +10,6 @@ export const refactoringSuggester: AgentDefinition = {
 
   model: 'inherit',
 
-  tools: ['Read', 'Glob', 'Grep'],
+  tools: ['Read', 'Glob', 'Grep', 'Skill'],
 
 };
