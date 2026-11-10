@@ -29,7 +29,7 @@ documented input parameters.
 PHASE 2: ANALYZE CHANGED FILES
 
 For every relevant changed source file, explicitly invoke
-ALL THREE specialized subagents using the Agent tool.
+ALL THREE specialized subagents using the Task tool.
 
 Required agents:
 
@@ -47,7 +47,7 @@ Required agents:
 
 IMPORTANT:
 Do not merely describe what the agents should do.
-Actually invoke each named agent using the Agent tool.
+Actually invoke each named agent using the Task tool.
 
 Provide each agent with:
 - Pull request information.
