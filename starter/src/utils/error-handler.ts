@@ -62,48 +62,87 @@ export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];
  * @returns The result of the successful function execution
  * @throws ReviewError with RETRY_EXHAUSTED code if all retries fail
  */
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = 3,
   delayMs: number = 1000
 ): Promise<T> {
-  // TODO: Implement retry logic with exponential backoff
-  // Hints:
-  // - Use a for loop from 1 to maxRetries
-  // - Use try/catch to catch errors
-  // - Calculate backoff: delayMs * Math.pow(2, attempt - 1)
-  // - Add jitter: Math.random() * 100
-  // - Use setTimeout wrapped in Promise for delay
-  // - Throw ReviewError with ErrorCodes.RETRY_EXHAUSTED if all retries fail
+  if (!Number.isInteger(maxRetries) || maxRetries < 1) {
+    throw new RangeError('maxRetries must be a positive integer');
+  }
 
-  throw new Error('Not implemented');
+  if (!Number.isFinite(delayMs) || delayMs < 0) {
+    throw new RangeError('delayMs must be non-negative');
+  }
+
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === maxRetries) {
+        break;
+      }
+
+      const backoff = delayMs * Math.pow(2, attempt - 1);
+      const jitter = Math.random() * 100;
+
+      await new Promise<void>(resolve => {
+        setTimeout(resolve, backoff + jitter);
+      });
+    }
+  }
+
+  throw new ReviewError(
+    `Operation failed after ${maxRetries} attempts: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`,
+    ErrorCodes.RETRY_EXHAUSTED,
+    {
+      attempts: maxRetries,
+      cause: lastError instanceof Error
+        ? lastError.message
+        : String(lastError)
+    }
+  );
 }
 
-/**
- * Wrap an async function with timeout
- *
- * This function races the provided function against a timeout.
- * Whichever completes first wins.
- *
- * @param fn - Async function to wrap
- * @param timeoutMs - Timeout in milliseconds
- * @param errorMessage - Custom error message
- * @returns The result of the function if it completes before timeout
- * @throws ReviewError with AGENT_TIMEOUT code if timeout is reached
- */
 export async function withTimeout<T>(
   fn: () => Promise<T>,
   timeoutMs: number,
   errorMessage: string = 'Operation timed out'
 ): Promise<T> {
-  // TODO: Implement timeout wrapper using Promise.race
-  // Hints:
-  // - Use Promise.race to race fn() against a timeout promise
-  // - The timeout promise should reject after timeoutMs milliseconds
-  // - Throw ReviewError with ErrorCodes.AGENT_TIMEOUT on timeout
-  // - Include timeoutMs in metadata
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('timeoutMs must be a positive number');
+  }
 
-  throw new Error('Not implemented');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(fn),
+
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new ReviewError(
+              errorMessage,
+              ErrorCodes.AGENT_TIMEOUT,
+              { timeoutMs }
+            )
+          );
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
