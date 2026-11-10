@@ -1,6 +1,6 @@
-
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
+import { RateLimiter, RateLimiterConfig } from './utils/rate-limiter';
 
 import {
   ReviewReportSchema,
@@ -31,6 +31,7 @@ export interface OrchestratorOptions {
   model?: string;
   maxTurns?: number;
   cwd?: string;
+  rateLimiterConfig?: Partial<RateLimiterConfig>;
 }
 
 /**
@@ -45,11 +46,13 @@ export class CodeReviewOrchestrator {
   private readonly cwd: string;
 
   private readonly agents: Record<string, AgentDefinition>;
+  private rateLimiter: RateLimiter;
 
   constructor(options: OrchestratorOptions = {}) {
     this.model = options.model || process.env.ANTHROPIC_MODEL || '';
     this.maxTurns = options.maxTurns ?? 50;
     this.cwd = options.cwd || process.cwd();
+    this.rateLimiter = new RateLimiter(options.rateLimiterConfig);
 
     if (!this.model) {
       throw new ReviewError(
