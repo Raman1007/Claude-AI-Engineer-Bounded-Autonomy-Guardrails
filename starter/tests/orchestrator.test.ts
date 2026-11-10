@@ -6,8 +6,10 @@ describe('CodeReviewOrchestrator', () => {
   let orchestrator: CodeReviewOrchestrator;
 
   beforeEach(() => {
-    orchestrator = new CodeReviewOrchestrator();
+  orchestrator = new CodeReviewOrchestrator({
+    model: 'test-model'
   });
+});
 
   describe('Configuration', () => {
     it('should initialize with default options', () => {
